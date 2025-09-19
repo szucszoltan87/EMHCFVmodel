@@ -1,0 +1,563 @@
+# Load necessary library
+
+require(stats)
+
+require(RInnoUtils)
+
+require(RInnoBLP)
+
+require(MIMATbase)
+
+library(tseries)
+
+library(plm)
+
+library(dplyr)
+
+library(urca)
+
+library(car)
+
+library(DescTools)
+
+library(MASS)
+
+library(purrr)
+
+library(tidyr)
+
+library(urca)
+
+library(lubridate)
+
+library(glmnet)
+
+library(strucchange)
+
+require(lmtest)
+
+require(sandwich)
+
+require(dplyr)
+
+ 
+
+# Define function to get the SharePoint path
+
+get_excel_path <- function() {
+
+  paste0(getSharePointPath(sDocumentLibrary="User Documents"),
+
+         "/Szucs/Capital Markets/Piarwise/EM Sov. HC vs. US Sovereigns/Model/EMBIG FV/EM_sov_credit_input_data.xlsx")
+
+}
+
+ 
+
+# Define function to read data from a specific sheet
+
+read_sheet <- function(sheet_name, cols=NULL, rows=NULL) {
+
+  read.xlsx.onedrive(xlsxFile=get_excel_path(), sheet=sheet_name, startRow=1, cols=cols, rows=rows, detectDates=TRUE)
+
+}
+
+ 
+
+# Read all necessary sheets
+
+GDP <- read_sheet("GDP", cols=2:41, rows=c(1,3:156))
+
+CPI <- read_sheet("CPI")
+
+Budget_bal <- read_sheet("fiscal balance")
+
+Debt <- read_sheet("PublicDebtToGDP")
+
+ExtDebt <- read_sheet("ExtDebt")
+
+CA <- read_sheet("CA(to GDP)")
+
+MarketRisk <- read_sheet("MarketRisk")
+
+CreditSpread <- read_sheet("Spreads")
+
+Rating <- read_sheet("Rating")
+
+ExtGrowth <- read_sheet("ExternalGrowth")
+
+BalanceSheet <- read_sheet("BalanceSheet")
+
+Weights <- read_sheet("JPM_EMBIGD_weights")
+
+ 
+
+# Add a variable named dxy by fetching data from Bloomberg
+
+dxy <- as.data.frame(get.endpoints(blph("DXY Index", "px_last", "20121030", "", Options=c("periodicityAdjustment"="CALENDAR","periodicitySelection"="MONTHLY"),PreviousDay = TRUE)))
+
+comm <- as.data.frame(get.endpoints(blph("BCOM Index", "px_last", "20121030", "", Options=c("periodicityAdjustment"="CALENDAR","periodicitySelection"="MONTHLY"),PreviousDay = TRUE)))
+
+ 
+
+# Creating the dataframes for the countries
+
+i <- 154 # add one when refreshing it
+
+ 
+
+# Define function to create country data frame
+
+create_country_df <- function(country, gdp_col, cpi_col, budget_bal_col, debt_col, extdebt_col, ca_col, spread_col, rating_col, weight_col) {
+
+  data.frame(
+
+    country=country,
+
+    date=GDP[1:i, 1],
+
+    gdp=GDP[1:i, gdp_col],
+
+    cpi=CPI[2:(i+1), cpi_col],
+
+    budget_bal=Budget_bal[2:(i+1), budget_bal_col],
+
+    debt=Debt[3:(i+2), debt_col],
+
+    extdebt=ExtDebt[2:(i+1), extdebt_col],
+
+    ca=CA[2:(i+1), ca_col],
+
+    spread=CreditSpread[3:(i+2), spread_col],
+
+    rating=Rating[2:(i+1), rating_col],
+
+    risk=MarketRisk[4:(i+3), 5],
+
+    dxy=dxy[1:i, 1],
+
+    comm=comm[1:i, 1],
+
+    extgrowth = ExtGrowth[2:(i+1), 6],
+
+    bs = BalanceSheet[4:(i+3), 8],
+
+    weights = Weights[2:(i+1),weight_col]
+
+  )
+
+}
+
+ 
+
+# List of countries and their corresponding columns in the data
+
+countries <- list(
+
+  list("Mexico", 2, 3, 3, 2, 2, 2, 2, 2, 24),
+
+  list("Indonesia", 3, 4, 4, 3, 3, 3, 3, 3, 19),
+
+  list("China", 4, 5, 5, 4, 4, 4, 4, 4, 8),
+
+  list("Turkey", 5, 6, 6, 5, 5, 5, 5, 5, 37),
+
+  list("Philippines", 6, 7, 7, 6, 6, 6, 6, 6, 30),
+
+  list("Brazil", 7, 8, 8, 7, 7, 7, 7, 7, 6),
+
+  list("Chile", 8, 9, 9, 8, 8, 8, 8, 8, 7),
+
+  list("Panama", 9, 10, 10, 9, 9, 9, 9, 9, 28),
+
+  list("Malaysia", 10, 11, 11, 10, 10, 10, 10, 10, 23),
+
+  list("Peru", 11, 12, 12, 11, 11, 11, 11, 11, 29),
+
+  list("South_Africa", 12, 13, 13, 12, 12, 12, 12, 12, 35),
+
+  list("Colombia", 13, 14, 14, 13, 13, 13, 13, 13, 9),
+
+  list("Dominican_Republic", 14, 15, 15, 14, 14, 14, 14, 14, 11),
+
+  list("Egypt", 15, 16, 16, 15, 15, 15, 15, 15, 13),
+
+  list("Kazakhstan", 16, 17, 17, 16, 16, 16, 16, 16, 21),
+
+  list("Nigeria", 18, 19, 19, 18, 18, 18, 18, 18, 25),
+
+  list("Hungary", 19, 20, 20, 19, 19, 19, 19, 19, 17),
+
+  list("Romania", 20, 21, 21, 20, 20, 20, 20, 20, 33),
+
+  list("Ecuador", 21, 22, 22, 21, 21, 21, 21, 21, 12),
+
+  list("Angola", 22, 23, 23, 22, 22, 22, 22, 22, 2),
+
+  list("Ghana", 23, 24, 24, 23, 23, 23, 23, 23, 15),
+
+  list("Argentina", 24, 25, 25, 24, 24, 24, 24, 24, 3),
+
+  list("Ukraine", 25, 26, 26, 25, 25, 25, 25, 25, 39),
+
+  list("Azerbaijan", 26, 27, 27, 26, 26, 26, 26, 26, 4),
+
+  list("Pakistan", 27, 28, 28, 27, 27, 27, 27, 27, 27),
+
+  list("Poland", 28, 29, 29, 28, 28, 28, 28, 28, 31),
+
+  list("Russia", 29, 30, 30, 29, 29, 29, 29, 29, 34),
+
+  list("Saudi_Arabia", 30, 31, 31, 30, 30, 30, 30, 30, 35),
+
+  list("UAE", 31, 32, 32, 31, 31, 31, 31, 31, 38),
+
+  list("Qatar", 32, 33, 33, 32, 32, 32, 32, 32, 32),
+
+  list("Oman", 33, 34, 34, 33, 33, 33, 33, 33, 26),
+
+  list("Bahrain", 34, 35, 35, 34, 34, 34, 34, 34, 5),
+
+  list("Costa_Rica", 35, 36, 36, 35, 35, 35, 35, 35, 10),
+
+  list("El_Salvador", 36, 37, 37, 36, 36, 36, 36, 36, 14),
+
+  list("Guatemala", 37, 38, 38, 37, 37, 37, 37, 37, 16),
+
+  list("India", 38, 39, 39, 38, 38, 38, 38, 38, 18),
+
+  list("Jordan", 39, 40, 40, 39, 39, 39, 39, 39, 20),
+
+  list("Kenya", 40, 41, 41, 40, 40, 40, 40, 40, 22)
+
+)
+
+ 
+
+# Create data frames for each country and bind them together
+
+df.all <- do.call(rbind, lapply(countries, function(c) {
+
+  create_country_df(c[[1]], c[[2]], c[[3]], c[[4]], c[[5]], c[[6]], c[[7]], c[[8]], c[[9]], c[[10]])
+
+}))
+
+ 
+
+# Convert all character columns to numeric except 'rating'
+
+df.all <- df.all %>%
+
+  mutate(across(where(is.character) & !matches(c("rating", "country")), as.numeric))
+
+ 
+
+#shortening the data set for training data
+
+df.all_train <- df.all %>%
+
+  dplyr::filter(date < as.Date("2024-12-31"))
+
+ 
+
+#differencing to eliminate non-stationarity
+
+pdata <- pdata.frame(df.all_train, index=c("country", "date"))
+
+pdata_clean <- na.omit(pdata)
+
+pdata_original <- pdata.frame(df.all, index=c("country", "date"))
+
+pdata_clean_original <- na.omit(pdata_original)
+
+ 
+
+# Conducting the panel cointegration test
+
+# Regress the dependent variable (spread) on the independent variables (gdp, cpi, etc.)
+
+model <- plm(spread ~ gdp + cpi + budget_bal + debt + extdebt + ca + factor(rating):risk + extgrowth + bs, data = pdata_clean, index=c("country", "date"), model = "within")
+
+summary_model <- summary(model)
+
+ 
+
+# Extract the coefficients table
+
+coefficients_table <- summary_model$coefficients
+
+ 
+
+# Filter the coefficients that are significant at the 5% level
+
+significant_coefficients <- coefficients_table[coefficients_table[, "Pr(>|t|)"] < 0.05, ]
+
+ 
+
+# Extract the row names of significant coefficients
+
+significant_coeff_names <- rownames(significant_coefficients)
+
+ 
+
+# Use grep to filter out names that start with "factor"
+
+non_factor_coeff_names <- significant_coeff_names[!grepl("^factor", significant_coeff_names)]
+
+ 
+
+# Construct the formula string
+
+formula_string <- paste("spread ~", paste(non_factor_coeff_names, collapse = " + "), "+ factor(rating):risk")
+
+ 
+
+# Convert the formula string to a formula object
+
+formula <- as.formula(formula_string)
+
+ 
+
+#Reducing model with singificant coefficients
+
+model_significant <- plm(formula, data = pdata_clean, index = c("country", "date"), model = "within")
+
+ 
+
+# Print the summary of the model
+
+summary(model_significant)
+
+ 
+
+# Extract residuals
+
+pdata_clean$residuals <- residuals(model_significant)
+
+ 
+
+# Perform a panel unit root test on the residuals
+
+adf_test_residuals <- purtest(pdata_clean$residuals, test = "ips", exo = "intercept")
+
+summary(adf_test_residuals)
+
+ 
+
+# Perform a panel unit root test on the residuals using the Fisher-type test
+
+fisher_test_residuals <- purtest(pdata_clean$residuals, test = "madwu")
+
+summary(fisher_test_residuals)
+
+ 
+
+# Extract the test statistic and p-value
+
+p_value_adf <- adf_test_residuals$statistic$p.value
+
+p_value_fisher <- fisher_test_residuals$statistic$p.value
+
+# Print the p-value
+
+print(paste("P-value:", p_value_adf))
+
+print(paste("P-value:", p_value_fisher))
+
+ 
+
+## Check if the residuals are stationary based on the p-value
+
+if (p_value_adf < 0.05) {
+
+  print("The residuals are stationary. The variables are cointegrated.")
+
+} else {
+
+  print("The residuals are not stationary. The variables are not cointegrated.")
+
+}
+
+ 
+
+if (p_value_fisher < 0.05) {
+
+  print("The residuals are stationary. The variables are cointegrated.")
+
+} else {
+
+  print("The residuals are not stationary. The variables are not cointegrated.")
+
+}
+
+ 
+
+# Q-Q plot
+
+qqnorm(residuals(model))
+
+qqline(residuals(model), col = "red")
+
+ 
+
+# Durbin-Watson test for autocorrelation
+
+dw_test <- dwtest(model)
+
+print(dw_test)
+
+ 
+
+# Jarque-Bera test for normality
+
+jb_test <- jarque.bera.test(residuals(model))
+
+print(jb_test)
+
+ 
+
+# Obtain robust standard errors
+
+robust_se <- coeftest(model, vcov = vcovHC(model, type = "HC1"))
+
+print(robust_se)
+
+ 
+
+#predicting the fair value of the diff log spread using robust standard errors on the full time series
+
+predicted_spread <- predict(model_significant, newdata = pdata_clean_original)
+
+ 
+
+# Predict the differences in log spreads
+
+pdata_clean_original$predicted_spread <- predicted_spread
+
+ 
+
+# Create a Data Frame with Country Names as Column Names and Dates as Row Names
+
+# Create an empty list to store data frames for each country
+
+country_list <- list()
+
+predicted_country_list <- list()
+
+weights_country_list <- list()
+
+ 
+
+# Get unique country names
+
+unique_countries <- unique(pdata_clean$country)
+
+ 
+
+# Loop through each country and create data frames with dates as row names
+
+for (country in unique_countries) {
+
+                country_data <- pdata_clean_original %>% filter(country == !!country)
+
+                country_list[[country]] <- data.frame(date = country_data$date, spread = country_data$spread)
+
+                predicted_country_list[[country]] <- data.frame(date = country_data$date, predicted_spread = country_data$predicted_spread)
+
+                weights_country_list[[country]] <- data.frame(date = country_data$date, weights = country_data$weights)
+
+}
+
+ 
+
+# Combine the lists into single data frames with dates as row names
+
+spread_df <- Reduce(function(x, y) merge(x, y, by = "date", all = TRUE), country_list)
+
+predicted_spread_df <- Reduce(function(x, y) merge(x, y, by = "date", all = TRUE), predicted_country_list)
+
+weights_df <- Reduce(function(x, y) merge(x, y, by = "date", all = TRUE), weights_country_list)
+
+ 
+
+# Set row names as dates
+
+rownames(spread_df) <- spread_df$date
+
+rownames(predicted_spread_df) <- predicted_spread_df$date
+
+rownames(weights_df) <- weights_df$date
+
+ 
+
+# Remove the date column
+
+spread_df <- spread_df[, -1]
+
+predicted_spread_df <- predicted_spread_df[, -1]
+
+weights_df <- weights_df[, -1]
+
+ 
+
+# Rename the columns to the country names
+
+colnames(spread_df) <- unique_countries
+
+colnames(predicted_spread_df) <- unique_countries
+
+colnames(weights_df) <- unique_countries
+
+ 
+
+# Create the benchmark spread by multiplying weights with the actual spreads
+
+benchmark_spread <- rowSums(weights_df * spread_df, na.rm = TRUE)/rowSums(weights_df, na.rm = TRUE) # adjusting the weights as we do not cover the 100% of the EMBIG
+
+ 
+
+# Create the model spread by multiplying weights with the predicted spreads
+
+model_spread <- rowSums(weights_df * predicted_spread_df, na.rm = TRUE)/rowSums(weights_df, na.rm = TRUE) # adjusting the weights as we do not cover the 100% of the EMBIG
+
+ 
+
+# Combine the benchmark spread and model spread into a single data frame
+
+index_df <- data.frame(
+
+                date = rownames(spread_df),
+
+                benchmark_spread = benchmark_spread,
+
+                model_spread = model_spread
+
+)
+
+ 
+
+# Set row names as dates and remove the date column
+
+rownames(index_df) <- index_df$date
+
+index_df <- index_df[, -1]
+
+ 
+
+#adding difference and standard deviation
+
+index_df$spread_diff <- model_spread-benchmark_spread
+
+ 
+
+# Add stdev lines
+
+index_df <- index_df %>%
+
+                mutate('-2 sigma' = -2 * sd(index_df$spread_diff),
+
+                                                               '-1 sigma' = -sd(index_df$spread_diff),
+
+                                                               '1 sigma' = sd(index_df$spread_diff),
+
+                                                               '2 sigma' = 2 * sd(index_df$spread_diff))
