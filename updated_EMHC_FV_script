@@ -1,0 +1,313 @@
+# ---- EM HC Fair-Value + Benchmarked Backtest ----
+suppressPackageStartupMessages({
+  library(data.table); library(dplyr); library(lubridate); library(glmnet)
+  library(readxl); library(zoo)
+})
+
+# ---------------- CONFIG ----------------
+INFILE    <- "E:/SzZ/EMHCspreadFV/data.xlsx"  # Excel with Sheet1 as shared
+SHEET     <- "Sheet1"
+TRAIN_END <- as.Date("2024-12-31")
+OOS_END   <- as.Date("2025-07-31")
+
+vars_global <- c("dxy","comm","risk")
+vars_fund   <- c("gdp","cpi","budget_bal","debt","extdebt","ca","extgrowth","bs")
+dep_var     <- "spread"
+
+# Backtest + costs scaling
+D_DEFAULT <- 7         # maps bps spread move to return proxy
+TC_BPS    <- 10        # per switch (round-trip split into entries/exits by trade_flag)
+
+# Grid search ranges
+GRID_START <- as.Date("2012-10-31")
+grid_entry    <- c(1.7, 1.9, 2.1, 2.3, 2.5)
+grid_exit     <- c(0.4, 0.5, 0.6)
+grid_confirm  <- c(2L, 3L)
+grid_hold     <- c(2L, 3L)
+grid_lambda   <- c(0.94, 0.97, 0.99)  # EWMA smoothing choices
+
+# Frictions for signal
+COOLDOWN        <- 1L
+STOP_AND_REVERSE<- FALSE
+TURNOVER_PENALTY<- 0.02  # subtract from IR per trade/year
+
+# --------------- LOAD & CLEAN ---------------
+DT <- as.data.table(read_excel(INFILE, sheet=SHEET))
+DT[, date := as.Date(date)]
+setorder(DT, country, date)
+
+# 1) Dates fully NA weights → set to NA_real_ so we can interpolate numerically
+dates_fix <- DT[, .(all_na = all(weights == "NA")), by = date][all_na == TRUE, date]
+DT[date %in% dates_fix, weights := NA_real_]
+
+# 2) Interpolate weights within country; no edge extrapolation here
+DT[, weights := na.approx(weights,
+                          x = as.integer(date),
+                          na.rm = FALSE,
+                          rule = 1),
+   by = country]
+
+# 3) Renormalize to 100 per date
+DT$weights <- as.numeric(DT$weights)
+DT[, weights := (weights / sum(weights, na.rm = TRUE)) * 100, by = date]
+
+# Restrict time, drop rows with missing essentials
+DT <- DT[date <= OOS_END]
+need <- c("country","date","weights",dep_var, vars_global, vars_fund)
+DT  <- DT[complete.cases(DT[, ..need])]
+
+# --------------- CCE (equal-weight) ---------------
+cvars <- c(dep_var, vars_global, vars_fund)
+CAVG  <- DT[, lapply(.SD, mean, na.rm=TRUE), by=.(date), .SDcols=cvars]
+setnames(CAVG, old=setdiff(names(CAVG),"date"),
+         new=paste0("cavg_", setdiff(names(CAVG),"date")))
+DT <- merge(DT, CAVG, by="date", all.x=TRUE)
+
+# --------------- Ridge/Lasso FV -------------------
+rhs <- c(vars_global, vars_fund, paste0("cavg_", cvars), "country")
+X   <- model.matrix(as.formula(paste("~ -1 +", paste(rhs, collapse="+"))), data=DT)
+y   <- DT[[dep_var]]
+mask_tr <- DT$date <= TRAIN_END
+
+X_tr <- X[mask_tr, , drop=FALSE]
+y_tr <- y[mask_tr]
+
+ridge_cv <- cv.glmnet(x = X_tr, y = y_tr, alpha = 0, intercept = FALSE, standardize = TRUE, nfolds = 10)
+lasso_cv <- cv.glmnet(x = X_tr, y = y_tr, alpha = 1, intercept = FALSE, standardize = TRUE, nfolds = 10)
+
+DT[, fit_ridge := as.numeric(predict(ridge_cv, newx = X, s = "lambda.min"))]
+DT[, fit_lasso := as.numeric(predict(lasso_cv, newx = X, s = "lambda.min"))]
+
+# --------------- Aggregate headline & benchmark ---
+agg <- DT[, .(
+  embig_bps = weighted.mean(get(dep_var), w=weights/100, na.rm=TRUE),
+  fv_ridge  = weighted.mean(fit_ridge,    w=weights/100, na.rm=TRUE),
+  fv_lasso  = weighted.mean(fit_lasso,    w=weights/100, na.rm=TRUE)
+), by=.(date)][order(date)]
+agg[, fv_ensemble := rowMeans(.SD, na.rm=TRUE), .SDcols=c("fv_ridge","fv_lasso")]
+
+# Passive benchmark (always long EMBIG) return proxy
+agg[, dspread   := c(NA, diff(embig_bps))]
+agg[, bench_ret := -(dspread) * (D_DEFAULT/10000)]
+
+# --------------- EWMA sigma & z helper ------------
+ewma_sigma_vec <- function(x, lam=0.94) {
+  v <- NA_real_; out <- numeric(length(x))
+  for (i in seq_along(x)) {
+    r <- x[i]; if (is.na(r)) { out[i] <- NA_real_; next }
+    v <- if (is.na(v)) r^2 else lam*v + (1-lam)*r^2
+    out[i] <- sqrt(v)
+  }; out
+}
+
+compute_z <- function(df, train_end, lam=0.94) {
+  df[, resid := embig_bps - fv_ensemble]  # + cheap (wide), - rich (tight)
+  df[, sigma_ewma := NA_real_]
+  df[date <= train_end, sigma_ewma := ewma_sigma_vec(resid, lam=lam)]
+  last_var <- tail(df[date <= train_end & !is.na(sigma_ewma), (sigma_ewma^2)], 1)
+  for (i in which(df$date > train_end)) {
+    r <- df$resid[i]
+    last_var <- lam*last_var + (1-lam)*ifelse(is.na(r),0,r^2)
+    df$sigma_ewma[i] <- sqrt(last_var)
+  }
+  df[, z_ewma := resid / sigma_ewma]
+  df[]
+}
+
+# --------------- Backtest with frictions -----------
+run_bt <- function(df, entry, exit, confirm, min_hold,
+                   tc_bps=10, D=7, cooldown=0L, stop_and_reverse=TRUE) {
+  s <- copy(df)[order(date)][, `:=`(signal=0L, trade_flag=0L)]
+  cur <- 0L; hold <- 0L; cool <- 0L; ow <- 0L; uw <- 0L
+  
+  for (i in seq_len(nrow(s))) {
+    z <- s$z_ewma[i]
+    if (is.na(z)) { s$signal[i] <- cur; next }
+    
+    # Correct sides: z >= entry (CHEAP) → long; z <= -entry (RICH) → short
+    ow <- if (z >=  entry) ow + 1L else 0L
+    uw <- if (z <= -entry) uw + 1L else 0L
+    
+    desired <- cur
+    if (cur == 0L) {
+      if (cool <= 0L) {
+        if (ow >= confirm) { desired <-  1L; hold <- 0L; cool <- 0L }
+        else if (uw >= confirm) { desired <- -1L; hold <- 0L; cool <- 0L }
+      }
+    } else {
+      if (abs(z) <= exit && hold >= min_hold) {   # normalize to fair
+        desired <- 0L; hold <- 0L; cool <- cooldown
+      } else if (stop_and_reverse) {
+        if (cur ==  1L && uw >= confirm && hold >= min_hold) { desired <- -1L; hold <- 0L }
+        if (cur == -1L && ow >= confirm && hold >= min_hold) { desired <-  1L; hold <- 0L }
+      }
+    }
+    
+    s$trade_flag[i] <- as.integer(desired != cur)
+    cur <- desired
+    s[i, signal := cur]
+    hold <- if (cur != 0L) hold + 1L else 0L
+    cool <- if (cool > 0L && cur == 0L) cool - 1L else cool
+  }
+  
+  # P&L proxy and costs
+  s[, dspread     := c(NA, diff(embig_bps))]
+  s[, strat_ret   := -(shift(signal,1L,0) * dspread) * (D/10000)]
+  s[, tc          := -(shift(trade_flag,1L,0)) * (tc_bps/10000) * D]
+  s[, net_alpha   := strat_ret + tc]
+  s[, bench_ret   := df$bench_ret]  # carry benchmark through same slice
+  s[]
+}
+
+# --------------- Performance vs Benchmark ----------
+perf <- function(s) {
+  ann <- 12
+  
+  # Overlay (alpha) stats
+  m_a <- mean(s$net_alpha, na.rm=TRUE)
+  v_a <- sd(s$net_alpha,   na.rm=TRUE)
+  
+  # Benchmark stats
+  m_b <- mean(s$bench_ret, na.rm=TRUE)
+  v_b <- sd(s$bench_ret,   na.rm=TRUE)
+  
+  # Combined = benchmark + overlay
+  comb <- s$bench_ret + s$net_alpha
+  m_c <- mean(comb, na.rm=TRUE)
+  v_c <- sd(comb,   na.rm=TRUE)
+  
+  # Max DD on cumulative overlay
+  na0 <- ifelse(is.na(s$net_alpha), 0, s$net_alpha)
+  cum <- cumsum(na0); dd <- cum - cummax(cum)
+  mdd <- if (length(dd)) min(dd, na.rm=TRUE) else NA
+  
+  data.frame(
+    AnnRet_Overlay = m_a*ann*100,
+    AnnVol_Overlay = v_a*sqrt(ann)*100,
+    IR_Overlay     = ifelse(v_a>0, (m_a*ann)/(v_a*sqrt(ann)), NA),
+    
+    AnnRet_Bench   = m_b*ann*100,
+    AnnVol_Bench   = v_b*sqrt(ann)*100,
+    Sharpe_Bench   = ifelse(v_b>0, (m_b*ann)/(v_b*sqrt(ann)), NA),
+    
+    AnnRet_Combined = m_c*ann*100,
+    AnnVol_Combined = v_c*sqrt(ann)*100,
+    Sharpe_Combined = ifelse(v_c>0, (m_c*ann)/(v_c*sqrt(ann)), NA),
+    
+    TE              = v_a*sqrt(ann)*100,     # TE = overlay vol
+    Trades          = sum(s$trade_flag, na.rm=TRUE),
+    HitRate         = mean(s$net_alpha>0, na.rm=TRUE),
+    MaxDD_pct       = 100*mdd
+  )
+}
+
+turns_per_year <- function(s) sum(s$trade_flag, na.rm=TRUE) / (uniqueN(s$date)/12)
+score_fun <- function(s, pen=0.02) {
+  ann <- 12
+  m_a <- mean(s$net_alpha, na.rm=TRUE)
+  v_a <- sd(s$net_alpha,   na.rm=TRUE)
+  ir  <- if (!is.na(v_a) && v_a>0) (m_a*ann)/(v_a*sqrt(ann)) else NA_real_
+  score <- if (is.finite(ir)) ir - pen*turns_per_year(s) else -Inf
+  list(ir=ir, score=score)
+}
+
+# --------------- Build z and TRAIN slice -----------
+agg <- compute_z(copy(agg), TRAIN_END, lam=grid_lambda[1])  # initialize with first lambda
+train_base <- agg[date >= GRID_START & date <= TRAIN_END]
+
+if (nrow(train_base) < 12 || all(is.na(train_base$z_ewma))) {
+  stop("Training window has insufficient/invalid z_ewma. Check data coverage and EWMA calc.")
+}
+
+# Benchmark stats on train
+bench_train <- with(train_base, {
+  ann <- 12
+  m <- mean(bench_ret, na.rm=TRUE); v <- sd(bench_ret, na.rm=TRUE)
+  data.frame(AnnRet_Bench=m*ann*100, AnnVol_Bench=v*sqrt(ann)*100,
+             Sharpe_Bench=ifelse(v>0,(m*ann)/(v*sqrt(ann)),NA))
+})
+cat("\n--- Benchmark on TRAIN ---\n"); print(bench_train)
+
+# --------------- Grid search (guarded + fallback) --
+best_guarded <- list(score=-Inf)
+best_any     <- list(score=-Inf)
+
+for (lam in grid_lambda) {
+  agg_l <- compute_z(copy(agg), TRAIN_END, lam=lam)
+  train_bt <- agg_l[date >= GRID_START & date <= TRAIN_END]
+  
+  for (e in grid_entry) for (x in grid_exit) for (cf in grid_confirm) for (mh in grid_hold) {
+    s  <- run_bt(train_bt, e, x, cf, mh, tc_bps=TC_BPS, D=D_DEFAULT,
+                 cooldown=COOLDOWN, stop_and_reverse=STOP_AND_REVERSE)
+    
+    sc <- score_fun(s, pen=TURNOVER_PENALTY)
+    pf <- perf(s)
+    
+    # Guards: beat benchmark Sharpe and positive excess return
+    req <- isTRUE(
+      is.finite(sc$ir) &&
+        is.finite(pf$Sharpe_Combined) && is.finite(pf$Sharpe_Bench) &&
+        (pf$Sharpe_Combined >= pf$Sharpe_Bench) &&
+        (pf$AnnRet_Combined >= pf$AnnRet_Bench) &&
+        (sc$ir > 0)
+    )
+    
+    # Track best_any (even if guards fail)
+    if (is.finite(sc$score) && sc$score > best_any$score) {
+      best_any <- c(list(lambda=lam, entry=e, exit=x, confirm=cf, min_hold=mh),
+                    sc, list(pf=pf, turns=sum(s$trade_flag, na.rm=TRUE)))
+    }
+    
+    # Track best_guarded (must pass guards)
+    if (req && is.finite(sc$score) && sc$score > best_guarded$score) {
+      best_guarded <- c(list(lambda=lam, entry=e, exit=x, confirm=cf, min_hold=mh),
+                        sc, list(pf=pf, turns=sum(s$trade_flag, na.rm=TRUE)))
+    }
+  }
+}
+
+chosen <- if (is.finite(best_guarded$score) && best_guarded$score > -Inf) {
+  cat("\n=== Best params (PASS guards) on TRAIN ===\n")
+  print(best_guarded[c("lambda","entry","exit","confirm","min_hold","ir","turns")]); print(best_guarded$pf)
+  best_guarded
+} else {
+  cat("\n*** WARNING: No combo passed the guards. Using best_any (highest IR - penalty). ***\n")
+  print(best_any[c("lambda","entry","exit","confirm","min_hold","ir","turns")]); print(best_any$pf)
+  best_any
+}
+
+# Safety check
+req_fields <- c("lambda","entry","exit","confirm","min_hold")
+if (any(vapply(chosen[req_fields], function(x) length(x)!=1 || is.null(x) || is.na(x), logical(1)))) {
+  stop("Grid search failed to produce valid parameters. Expand grid or relax guards.")
+}
+
+# --------------- Final backtests -------------------
+# Rebuild z with chosen lambda
+agg_final <- compute_z(copy(agg), TRAIN_END, lam = chosen$lambda)
+
+BT_tr  <- run_bt(agg_final[date >= GRID_START & date <= TRAIN_END],
+                 chosen$entry, chosen$exit, chosen$confirm, chosen$min_hold,
+                 tc_bps=TC_BPS, D=D_DEFAULT, cooldown=COOLDOWN, stop_and_reverse=STOP_AND_REVERSE)
+
+BT_oos <- run_bt(agg_final[date > TRAIN_END & date <= OOS_END],
+                 chosen$entry, chosen$exit, chosen$confirm, chosen$min_hold,
+                 tc_bps=TC_BPS, D=D_DEFAULT, cooldown=COOLDOWN, stop_and_reverse=STOP_AND_REVERSE)
+
+BT_all <- rbindlist(list(BT_tr, BT_oos))[order(date)]
+
+cat("\n=== Performance summary (Strategy vs Benchmark) ===\n")
+print(rbind(
+  cbind(Period="Train", perf(BT_tr)),
+  cbind(Period="OOS",   perf(BT_oos)),
+  cbind(Period="All",   perf(BT_all))
+))
+
+cat("\n=== Last 12 rows (date, headline, FV, z, signal, strat_ret, bench_ret, net_alpha) ===\n")
+print(BT_all[, .(date, embig_bps, fv_ensemble, z_ewma, signal, strat_ret, bench_ret, net_alpha)][.N-11:.N])
+
+# Handy quick checks
+cat("\nTrades per year (All): ",
+    sum(BT_all$trade_flag, na.rm=TRUE) / (uniqueN(BT_all$date)/12), "\n")
+
+write_xlsx(BT_all)
